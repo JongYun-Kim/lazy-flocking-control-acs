@@ -851,7 +851,7 @@ class LazyControlFlockingEnv(gym.Env):
                 active_neighbor_masks = np.eye(num_agents, dtype=np.bool_)  # (num_agents, num_agents)
             else:
                 active_neighbor_masks = np.zeros((num_agents, num_agents), dtype=np.bool_)
-            p = np.random.permutation(num_agents)
+            p = self.np_random.permutation(num_agents)
             i, j = p[:-1], p[1:]  # indices of the neighbors
             active_neighbor_masks[i, j] = True  # set the neighbors
             active_neighbor_masks[j, i] = True  # set the neighbors symmetrically
@@ -1305,12 +1305,12 @@ def visualize_results(agent_states, spatial_entropy_hist, velocity_entropy_hist,
 
 
 if __name__ == "__main__":
-    my_seed_id = 2
+    my_seed_id = 3
     my_config = load_config('./default_env_config.yaml')
     my_config.env.enable_line_topology = True
     my_config.env.get_state_hist = True
-    my_config.control.max_turn_rate = 1e4
-    my_config.env.max_time_steps = 2000
+    # my_config.control.max_turn_rate = 1e4
+    my_config.env.max_time_steps = 8192
 
     env_context = {"seed_id": my_seed_id, "config": my_config}
 
