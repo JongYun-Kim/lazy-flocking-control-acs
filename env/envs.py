@@ -631,9 +631,9 @@ class LazyControlFlockingEnv(gym.Env):
                 elif self.config.env.custom_topology == "ring":
                     next_neighbor_masks, comm_loss_agents = self.compute_neighbor_agents_in_line_topology(
                         agent_states=next_agent_states, padding_mask=padding_mask, init=init, ring=True)
-                # elif self.config.env.custom_topology == "star":
-                #     next_neighbor_masks, comm_loss_agents = self.compute_neighbor_agents_in_star_topology(
-                #         agent_states=next_agent_states, padding_mask=padding_mask, init=init)
+                elif self.config.env.custom_topology == "star":
+                    next_neighbor_masks, comm_loss_agents = self.compute_neighbor_agents_in_star_topology(
+                        agent_states=next_agent_states, padding_mask=padding_mask, init=init)
                 else:
                     raise NotImplementedError(f"Custom topology {self.config.env.custom_topology} is not implemented.")
             else:
@@ -883,6 +883,48 @@ class LazyControlFlockingEnv(gym.Env):
             self.fixed_topology_info = copy.deepcopy(neighbor_masks)  # Save the fixed topology info
 
         comm_loss_agents = None  # No communication loss in line topology
+
+        return self.fixed_topology_info, comm_loss_agents  # (num_agents_max, num_agents_max), None
+
+    def compute_neighbor_agents_in_star_topology(self, agent_states, padding_mask, init=False, include_self_loops=True):
+        """
+        Computes the neighbor matrix based on star topology.
+        In star topology, a single central agent is connected to all others.
+        :param agent_states: (num_agents_max, 5)
+        :param padding_mask: (num_agents_max)
+        :param init: if True, initializes the neighbor masks; otherwise, returns previously saved one
+        :param include_self_loops: if True, includes self-loops; otherwise, excludes them
+        :return: neighbor_masks: (num_agents_max, num_agents_max)
+        :return: comm_loss_agents: (num_agents_max)
+        """
+        if init:
+            num_agents = padding_mask.sum()
+            if num_agents < 2:
+                raise ValueError("Star topology requires at least 2 active agents.")
+
+            active_neighbor_masks = np.zeros((num_agents, num_agents), dtype=np.bool_)
+
+            center_idx = self.np_random.integers(low=0, high=num_agents)
+
+            # Create connection vector: True for all except center
+            connections = np.ones(num_agents, dtype=np.bool_)
+            connections[center_idx] = False
+
+            # Use broadcasting to set both directions (undirected edges)
+            active_neighbor_masks[center_idx, :] = connections
+            active_neighbor_masks[:, center_idx] = connections
+
+            if include_self_loops:
+                np.fill_diagonal(active_neighbor_masks, True)
+
+            neighbor_masks = np.zeros((self.num_agents_max, self.num_agents_max), dtype=np.bool_)
+            active_indices = np.nonzero(padding_mask)[0]
+            neighbor_masks[np.ix_(active_indices, active_indices)] = active_neighbor_masks
+
+            # Cache fixed topology
+            self.fixed_topology_info = copy.deepcopy(neighbor_masks)
+
+        comm_loss_agents = None  # No agents are disconnected in star topology
 
         return self.fixed_topology_info, comm_loss_agents  # (num_agents_max, num_agents_max), None
 
@@ -1324,12 +1366,15 @@ def visualize_results(agent_states, spatial_entropy_hist, velocity_entropy_hist,
 
 
 if __name__ == "__main__":
-    my_seed_id = 3
-    my_config.env.get_state_hist = True
+    my_seed_id = 42
     my_config = load_config('./default_env_config.yaml')
+    my_config.env.get_state_hist = True
+    my_config.env.entropy_p_goal = 45  # Spatial entropy goal
+    my_config.env.entropy_v_goal = 0.2  # Velocity entropy goal
     my_config.env.enable_custom_topology = True
-    my_config.env.custom_topology = "line"
+    # my_config.env.custom_topology = "line"
     # my_config.env.custom_topology = "ring"
+    my_config.env.custom_topology = "star"
     # my_config.control.max_turn_rate = 1e4
     my_config.env.max_time_steps = 8192
 
@@ -1362,5 +1407,8 @@ if __name__ == "__main__":
         episode_length=episode_length,
         config=env.config,
     )
+
+    print(f"Spatial Entropy: {spatial_entropy_hist[episode_length-1]}")
+    print(f"Velocity Entropy: {velocity_entropy_hist[episode_length-1]}")
 
     print("Paused here for demonstration")
