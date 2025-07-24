@@ -19,6 +19,7 @@ import yaml
 import matplotlib.pyplot as plt
 from matplotlib.patches import Arrow
 import matplotlib.gridspec as gridspec
+import copy
 
 
 class ControlConfig(BaseModel):
@@ -44,7 +45,8 @@ class EnvConfig(BaseModel):
     action_type: str = 'laziness_vector'
     num_agents_pool: List[conint(ge=1)]  # Must clarify it !!
     dt: float = 0.1
-    enable_line_topology: bool = False  # If True, the agents are connected in a line topology
+    enable_custom_topology: bool = False  # If True, the agents are connected in a custom topology
+    custom_topology: Optional[str] = None  # Name of the custom topology
     comm_range: Optional[float] = None
     max_time_steps: int = 1000
     use_fixed_episode_length: bool = False
@@ -277,10 +279,13 @@ class LazyControlFlockingEnv(gym.Env):
         else:
             raise NotImplementedError("task_type must be either vicsek or acs at the moment")
 
-        if self.config.env.comm_range is not None and self.config.env.enable_line_topology==True:
-            # warnings.warn("enable_line_topology is set to True, but comm_range is not None. "
-            #               "This may lead to unexpected behavior. Please check your configuration.")
-            raise ValueError("enable_line_topology cannot be True when comm_range is not None. Check your env config.")
+        if self.config.env.enable_custom_topology:
+            assert isinstance(self.config.env.custom_topology, str), \
+                "custom_topology must be a str when enable_custom_topology is True"
+            if self.config.env.comm_range is not None:
+                # warnings.warn("enable_custom_topology is set to True, but comm_range is not None. "
+                #               "This may lead to unexpected behavior. Please check your configuration.")
+                raise ValueError("enable_custom_topology cannot be True when comm_range is not None. Check env config.")
 
     def show_current_config(self):
         print('-------------------CURRENT CONFIG-------------------')
@@ -331,11 +336,7 @@ class LazyControlFlockingEnv(gym.Env):
         padding_mask[:num_agents] = True
         # # neighbor_masks
         self.config.env.comm_range = comm_range
-        if self.config.env.comm_range is None:
-            neighbor_masks = np.ones((num_agents_max, num_agents_max), dtype=np.bool_)
-        else:
-            neighbor_masks = self.compute_neighbor_agents(
-                agent_states=agent_states, padding_mask=padding_mask, communication_range=self.config.env.comm_range)[0]
+        neighbor_masks, _ = self.update_network_topology(agent_states, padding_mask, init=True)
         # # state!
         self.state = {"agent_states": agent_states, "neighbor_masks": neighbor_masks, "padding_mask": padding_mask}
         self.initial_state = self.state
@@ -370,15 +371,9 @@ class LazyControlFlockingEnv(gym.Env):
         v[self.num_agents:] = 0
         # # Concatenate p v th
         agent_states = np.concatenate([p, v, th[:, np.newaxis]], axis=1)  # (num_agents_max, 5)
-        if self.config.env.comm_range is None:
-            if self.config.env.enable_line_topology:
-                neighbor_masks = self.compute_neighbor_agents_in_line_topology(
-                    agent_states=agent_states, padding_mask=padding_mask, init=True)[0]
-            else:
-                neighbor_masks = np.ones((self.num_agents_max, self.num_agents_max), dtype=np.bool_)
-        else:
-            neighbor_masks = self.compute_neighbor_agents(
-                agent_states=agent_states, padding_mask=padding_mask, communication_range=self.config.env.comm_range)[0]
+
+        neighbor_masks, _ = self.update_network_topology(agent_states, padding_mask, init=True)
+
         self.state = {"agent_states": agent_states, "neighbor_masks": neighbor_masks, "padding_mask": padding_mask}
         self.has_lost_comm = False
 
@@ -605,17 +600,8 @@ class LazyControlFlockingEnv(gym.Env):
         next_agent_states = self.update_agent_states(state=state, control_inputs=control_inputs)
 
         # 4. Update network topology (i.e. neighbor_masks) based on the new agent states
-        if self.config.env.comm_range is None:
-            if self.config.env.enable_line_topology:
-                next_neighbor_masks, comm_loss_agents = self.compute_neighbor_agents_in_line_topology(
-                    agent_states=next_agent_states, padding_mask=state["padding_mask"])
-            else:
-                next_neighbor_masks = state["neighbor_masks"]
-                comm_loss_agents = None
-        else:
-            next_neighbor_masks, comm_loss_agents = self.compute_neighbor_agents(
-                agent_states=next_agent_states, padding_mask=state["padding_mask"],
-                communication_range=self.config.env.comm_range)
+        next_neighbor_masks, comm_loss_agents = self.update_network_topology(
+            next_agent_states=next_agent_states, padding_mask=state["padding_mask"], init=False)
 
         # 5. Update the active agents (i.e. padding_mask); you may lose or gain agents
         # next_padding_mask = self.update_active_agents(
@@ -629,6 +615,36 @@ class LazyControlFlockingEnv(gym.Env):
                       }
 
         return next_state, control_inputs, comm_loss_agents
+
+    def update_network_topology(self, next_agent_states, padding_mask, init=False):
+        """
+        Update the network topology based on the new agent states
+        :param next_agent_states: ndarray of shape (num_agents_max, 5)
+        :param padding_mask: ndarray of shape (num_agents_max,)
+        :return: next_neighbor_masks: ndarray of shape (num_agents_max, num_agents_max)
+        """
+        if self.config.env.comm_range is None:
+            if self.config.env.enable_custom_topology:
+                if self.config.env.custom_topology == "line":
+                    next_neighbor_masks, comm_loss_agents = self.compute_neighbor_agents_in_line_topology(
+                        agent_states=next_agent_states, padding_mask=padding_mask, init=init)
+                elif self.config.env.custom_topology == "ring":
+                    next_neighbor_masks, comm_loss_agents = self.compute_neighbor_agents_in_line_topology(
+                        agent_states=next_agent_states, padding_mask=padding_mask, init=init, ring=True)
+                # elif self.config.env.custom_topology == "star":
+                #     next_neighbor_masks, comm_loss_agents = self.compute_neighbor_agents_in_star_topology(
+                #         agent_states=next_agent_states, padding_mask=padding_mask, init=init)
+                else:
+                    raise NotImplementedError(f"Custom topology {self.config.env.custom_topology} is not implemented.")
+            else:
+                next_neighbor_masks = np.ones((self.num_agents_max, self.num_agents_max), dtype=np.bool_)
+                comm_loss_agents = None
+        else:
+            next_neighbor_masks, comm_loss_agents = self.compute_neighbor_agents(
+                agent_states=next_agent_states, padding_mask=padding_mask,
+                communication_range=self.config.env.comm_range)
+
+        return next_neighbor_masks, comm_loss_agents
 
     def get_vicsek_control(self, state, rel_state, new_network):
         """
@@ -834,7 +850,7 @@ class LazyControlFlockingEnv(gym.Env):
 
         return next_neighbor_masks, comm_loss_agents  # (num_agents_max, num_agents_max), (num_agents_max)
 
-    def compute_neighbor_agents_in_line_topology(self, agent_states, padding_mask, init=False, include_self_loops=True):
+    def compute_neighbor_agents_in_line_topology(self, agent_states, padding_mask, init=False, ring=False, include_self_loops=True):
         """
         Computes the neighbor matrix based on line topology
         :param agent_states: (num_agents_max, 5)
@@ -855,13 +871,16 @@ class LazyControlFlockingEnv(gym.Env):
             i, j = p[:-1], p[1:]  # indices of the neighbors
             active_neighbor_masks[i, j] = True  # set the neighbors
             active_neighbor_masks[j, i] = True  # set the neighbors symmetrically
+            if ring:  # if ring topology, connect the first and last agents
+                active_neighbor_masks[p[0], p[-1]] = True
+                active_neighbor_masks[p[-1], p[0]] = True
 
             # Put the active neighbor masks into the full neighbor masks
             neighbor_masks = np.zeros((self.num_agents_max, self.num_agents_max), dtype=np.bool_)  # (num_agents_max, num_agents_max)
             active_agents_indices = np.nonzero(padding_mask)[0]
             neighbor_masks[np.ix_(active_agents_indices, active_agents_indices)] = active_neighbor_masks
 
-            self.fixed_topology_info = neighbor_masks
+            self.fixed_topology_info = copy.deepcopy(neighbor_masks)  # Save the fixed topology info
 
         comm_loss_agents = None  # No communication loss in line topology
 
@@ -1155,7 +1174,7 @@ def visualize_results(agent_states, spatial_entropy_hist, velocity_entropy_hist,
     :param episode_length: int
     :param config: Config object
     """
-    fig = plt.figure(figsize=(15, 10))
+    fig = plt.figure(figsize=(15, 10), dpi=300)
     gs = gridspec.GridSpec(2, 1, height_ratios=[2, 1])
 
     # 1. Plot agent trajectories and final directions
@@ -1306,9 +1325,11 @@ def visualize_results(agent_states, spatial_entropy_hist, velocity_entropy_hist,
 
 if __name__ == "__main__":
     my_seed_id = 3
-    my_config = load_config('./default_env_config.yaml')
-    my_config.env.enable_line_topology = True
     my_config.env.get_state_hist = True
+    my_config = load_config('./default_env_config.yaml')
+    my_config.env.enable_custom_topology = True
+    my_config.env.custom_topology = "line"
+    # my_config.env.custom_topology = "ring"
     # my_config.control.max_turn_rate = 1e4
     my_config.env.max_time_steps = 8192
 
