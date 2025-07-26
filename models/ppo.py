@@ -315,12 +315,15 @@ class LazyControllerTorch(nn.Module):
         #
         #    So now we pass the flattened arguments:
         # ------------------------------------------------------------
+        local_agent_indices = torch.repeat_interleave(torch.arange(num_agents_max, device=flat_agent_infos.device), batch_size)
+
         sub_att_scores_flat, _, h_c_N_flat = self.local_forward(
             flat_agent_infos,  # (batch_size * num_agents_max, num_agents_max, obs_dim)
             flat_network,  # (batch_size * num_agents_max, num_agents_max)
             flat_padding_mask_for_neighbors,  # (batch_size * num_agents_max, num_agents_max)
             flat_is_from_my_env,  # (batch_size * num_agents_max,)
-            flat_local_padding_flags  # (batch_size * num_agents_max,)
+            flat_local_padding_flags,  # (batch_size * num_agents_max,)
+            local_agent_indices,  # (batch_size * num_agents_max,)  # Not used in the vectorized version
         )
         # sub_att_scores_flat => (batch_size * num_agents_max, num_agents_max)
         # h_c_N_flat         => (batch_size * num_agents_max, 1, d_embed_context)
@@ -368,6 +371,7 @@ class LazyControllerTorch(nn.Module):
             padding_mask,
             is_from_my_env,
             local_padding_flags,
+            local_agent_indices,  # For laziness calculation (each vectorized agent computes scalar laziness due to masking complexity)
     ):
         """
         :param local_agent_info: (batch_size, num_agents_max, obs_dim)
@@ -375,6 +379,13 @@ class LazyControllerTorch(nn.Module):
         :param padding_mask:     (batch_size, num_agents_max)
         :param is_from_my_env:   (batch_size,)
         :param local_padding_flags: (batch_size,)  # Checks if the agent of each batch is padded or not in local_forward
+        :param local_agent_indices: (batch_size * num_agents_max,)  # [0, 0, ..., 1, 1, ..., num_agents_max-1, num_agents_max-1, ...]
+            [
+                agent_0 in batch_0, agent_0 in batch_1, ..., agent_0 in batch_{B-1},
+                agent_1 in batch_0, agent_1 in batch_1, ..., agent_1 in batch_{B-1},
+                ...
+                agent_{A-1} in batch_0, ..., agent_{A-1} in batch_{B-1}
+            ]
         :return: sub_att_scores: (batch_size, num_agents_max)
         """
         batch_size, num_agents_max, obs_dim = local_agent_info.shape
@@ -392,17 +403,19 @@ class LazyControllerTorch(nn.Module):
             local_agent_info_np = local_agent_info[non_padded_mask]  # (n_non_padded, num_agents_max, obs_dim)
             local_network_np = local_network[non_padded_mask]  # (n_non_padded, num_agents_max)
             is_from_my_env_np = is_from_my_env[non_padded_mask]  # (n_non_padded,)
+            local_agent_indices_np = local_agent_indices[non_padded_mask]  # (n_non_padded,)
+            np_size = local_agent_info_np.shape[0]  # Number of non-padded sequences
 
             # Masks for non-padded sequences
             src_mask_tokens = local_network_np.ne(0)  # (n_non_padded, num_agents_max)
             src_mask_idx = 0
             src_mask = self.make_src_mask(src_mask_tokens, mask_idx=src_mask_idx)
             tgt_mask = None
-            context_mask_token = torch.ones_like(src_mask_tokens[:, 0:1], dtype=torch.bool)
+            context_mask_token = torch.ones_like(src_mask_tokens[:, 0:1], dtype=torch.bool)  # (n_non_padded, 1)
             src_tgt_mask = self.make_src_tgt_mask(src_mask_tokens, context_mask_token, mask_idx=src_mask_idx)
 
             # Encoding
-            encoder_out = self.encode(local_agent_info_np, src_mask.unsqueeze(1))
+            encoder_out = self.encode(local_agent_info_np, src_mask.unsqueeze(1))  # (n_non_padded, num_agents_max, d_embed)
 
             # Context embedding
             h_c_N_np = self.get_context_vector(
@@ -414,11 +427,13 @@ class LazyControllerTorch(nn.Module):
             )  # (n_non_padded, 1, d_embed_context)
 
             # Decoding
-            decoder_out_np = self.decode(h_c_N_np, encoder_out, tgt_mask, src_tgt_mask.unsqueeze(1))
+            decoder_out_np = self.decode(h_c_N_np, encoder_out, tgt_mask, src_tgt_mask.unsqueeze(1))  # (n_non_padded, 1, d_embed_context)
 
             # Generator
-            sub_att_scores_np = self.generator(input_query=decoder_out_np, input_key=encoder_out,
-                                               mask=src_tgt_mask).squeeze(1)  # (n_non_padded, num_agents_max)
+            non_pad_indices = torch.arange(np_size)
+            local_agent_embeddings = encoder_out[non_pad_indices, local_agent_indices_np]  # (n_non_padded, d_embed)
+            sub_att_scores_np = self.generator(input_query=decoder_out_np, input_key=local_agent_embeddings,
+                                               mask=src_tgt_mask).squeeze(1)  # (n_non_padded, 1)  TODO: 차원 없어지는지 체크하고 여기부터 나중에 다시 보셈
 
             # Update results for non-padded sequences
             decoder_out[non_padded_mask] = decoder_out_np
